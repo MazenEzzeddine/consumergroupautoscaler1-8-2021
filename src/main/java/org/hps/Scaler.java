@@ -17,16 +17,21 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 
+
+
+
+//this is a working version
 public class Scaler {
     static RLS rls;
-    static double[][] Xx;
-    static RealMatrix X;
-    static int iteration = 0;
+    static double[][] regArr;
+    static RealMatrix regMatrix;
+    static int iteration;
+    static int num_vars;
 
     Scaler() {
     }
 
-    public static final String CONSUMER_GROUP = "testgroup3";
+    public static  String CONSUMER_GROUP;
     public static int numberOfPartitions;
     static boolean scaled = false;
     public static AdminClient admin = null;
@@ -38,6 +43,9 @@ public class Scaler {
     public static Map<TopicPartition, Long> partitionToLag = new HashMap<>();
     public static Map<MemberDescription, Float> maxConsumptionRatePerConsumer = new HashMap<>();
     public static Map<MemberDescription, Long> consumerToLag = new HashMap<>();
+
+    public static  String mode;
+
 
 
     static boolean firstIteration = true;
@@ -53,6 +61,7 @@ public class Scaler {
     static double prediction = 0;
     private static Instant start = null;
     static long elapsedTime;
+    static String BOOTSTRAP_SERVERS;
 
     public static void main(String[] args) throws ExecutionException, InterruptedException {
         //TODO Externalize topic, cluster name, and all configurations
@@ -66,6 +75,9 @@ public class Scaler {
         choice = System.getenv("CHOICE");
         uth= Float.parseFloat(System.getenv("uth"));
         dth= Float.parseFloat(System.getenv("dth"));
+        CONSUMER_GROUP = System.getenv("CONSUMER_GROUP");
+        mode = System.getenv("Mode");
+        BOOTSTRAP_SERVERS = System.getenv("BOOTSTRAP_SERVERS");
 
 
         log.info("sleep is {}", sleep);
@@ -77,25 +89,30 @@ public class Scaler {
         log.info("dth is {}", dth);
 
         Properties props = new Properties();
-        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "my-cluster-kafka-bootstrap:9092");
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
         props.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, 3000);
         props.put(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 3000);
         admin = AdminClient.create(props);
         /////////////////////////////////////////////////////////////
-        rls = new RLS(4, 0.98);
+        num_vars = 4;
+        rls = new RLS(num_vars, 0.98);
         iteration = 0;
-        Xx = new double[1][4];
+        regArr = new double[1][num_vars];
 
-        for (int j = 0; j < 4; j++)
-            Xx[0][j] = 0;
+        for (int j = 0; j < num_vars; j++)
+            regArr[0][j] = 0;
 
-        X = new Array2DRowRealMatrix(Xx);
+
+        //regressor array
+        regMatrix = new Array2DRowRealMatrix(regArr);
 
         ///////////////////////////////////////////////////////////////////////////////////////
         while (true) {
-            log.info("====================================Start Iteration====================" +
-                    "==========================");
+            log.info("=================Start Iteration===============" +
+                    "=======");
             log.info("Iteration {}", iteration);
+
+            //get committed  offsets
             Map<TopicPartition, OffsetAndMetadata> offsets =
                     admin.listConsumerGroupOffsets(CONSUMER_GROUP)
                             .partitionsToOffsetAndMetadata().get();
@@ -106,6 +123,7 @@ public class Scaler {
                 requestLatestOffsets.put(tp, OffsetSpec.latest());
                 partitionToLag.put(tp, 0L);
             }
+            //blocking call to query latest offset
             Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> latestOffsets =
                     admin.listOffsets(requestLatestOffsets).all().get();
             //////////////////////////////////////////////////////////////////////
@@ -117,8 +135,7 @@ public class Scaler {
                 long lag = latestOffset - committedOffset;
 
                 if (!firstIteration) {
-                    previousPartitionToCommittedOffset.put(e.getKey(),
-                            currentPartitionToCommittedOffset.get(e.getKey()));
+                    previousPartitionToCommittedOffset.put(e.getKey(), currentPartitionToCommittedOffset.get(e.getKey()));
                     previousPartitionToLastOffset.put(e.getKey(), currentPartitionToLastOffset.get(e.getKey()));
                 }
                 currentPartitionToCommittedOffset.put(e.getKey(), committedOffset);
@@ -157,15 +174,19 @@ public class Scaler {
             }
             if(!firstIteration) {
                 //justPredict3(consumerGroupDescriptionMap);
-                scaleDecision2(consumerGroupDescriptionMap);
+                if(mode.equalsIgnoreCase("proactive")){
+                    justPredict3(consumerGroupDescriptionMap);
+                } else {
+                    scaleDecision2(consumerGroupDescriptionMap);
+                }
 
             } else {
                 firstIteration = false;
             }
 
             log.info("sleeping for  {} secs", sleep);
-            log.info("====================================End Iteration=====" +
-                    "=========================================");
+            log.info("====================End Iteration=====" +
+                    "==========");
             Thread.sleep(sleep);
         }
     }
@@ -215,30 +236,29 @@ public class Scaler {
             double y1 = Double.parseDouble(String.valueOf((totalArrivalRate*1000)));
             log.info(" iteration {} last time  prediction and arrival rate {}", iteration, (float) (prediction)) ;
             log.info(" iteration {} current actual value of  arrival rate = {}", iteration, y1);
-            rls.add_obs(X.transpose(), y1);
-            for(int j = 0; j < 3; j++)
-                Xx[0][j] = Xx[0][j + 1];
-            Xx[0][3] = y1;
-            X = new Array2DRowRealMatrix(Xx);
-            log.info(X);
-            prediction = (rls.getW().transpose().multiply(X.transpose())).getEntry(0, 0);
+            rls.add_obs(regMatrix.transpose(), y1);
+            for(int j = 0; j < num_vars-1; j++)
+                regArr[0][j] = regArr[0][j + 1];
+            regArr[0][num_vars-1] = y1;
+            regMatrix = new Array2DRowRealMatrix(regArr);
+            log.info(regMatrix);
+            prediction = (rls.getW().transpose().multiply(regMatrix.transpose())).getEntry(0, 0);
             log.info(" Iteration {} prediction  next arrival rate {}", iteration, (float) (prediction));
-            iteration++;
         } else {
             double y1 = Double.parseDouble(String.valueOf((totalArrivalRate*1000)));
             log.info(" iteration {} last time  prediction  and arrival rate {}", iteration, (float) (prediction)) ;
             log.info(" iteration {} current actual value of  arrival rate = {}", iteration, y1);
-            rls.add_obs(X.transpose(), y1);
-            for(int j = 0; j < 3; j++)
-                Xx[0][j] = Xx[0][j + 1];
-            Xx[0][3] = y1;
-            X = new Array2DRowRealMatrix(Xx);
-            log.info(X);
-            prediction = (rls.getW().transpose().multiply(X.transpose())).getEntry(0, 0);
+            rls.add_obs(regMatrix.transpose(), y1);
+            for(int j = 0; j < num_vars-1; j++)
+                regArr[0][j] = regArr[0][j + 1];
+            regArr[0][num_vars-1] = y1;
+            regMatrix = new Array2DRowRealMatrix(regArr);
+            log.info(regMatrix);
+            prediction = (rls.getW().transpose().multiply(regMatrix.transpose())).getEntry(0, 0);
             log.info(" Iteration {} prediction for next  arrival rate is {}", iteration, (float) (prediction));
-            iteration++;
             log.info("=================================:");
         }
+        iteration++;
     }
 
 
@@ -249,10 +269,10 @@ public class Scaler {
         int size = consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).members().size();
         log.info("Currently we have this number of consumers {}", size);
 
-        long totalpoff = 0;
-        long totalcoff = 0;
-        long totalepoff = 0;
-        long totalecoff = 0;
+        long totalpoff;
+        long totalcoff;
+        long totalepoff;
+        long totalecoff;
         for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).members()) {
             totalpoff = 0;
             totalcoff = 0;
@@ -286,15 +306,15 @@ public class Scaler {
             double y1 = Double.parseDouble(String.valueOf((totalArrivalRate * 1000)));
             log.info(" iteration {} last time  prediction and arrival rate {}", iteration, (float) (prediction));
             log.info(" iteration {} current actual value of  arrival rate = {}", iteration, y1);
-            rls.add_obs(X.transpose(), y1);
-            for (int j = 0; j < 3; j++)
-                Xx[0][j] = Xx[0][j + 1];
-            Xx[0][3] = y1;
-            X = new Array2DRowRealMatrix(Xx);
-            log.info(X);
-            prediction = (rls.getW().transpose().multiply(X.transpose())).getEntry(0, 0);
+            rls.add_obs(regMatrix.transpose(), y1);
+            for(int j = 0; j <  num_vars -1; j++)
+                regArr[0][j] = regArr[0][j + 1];
+            regArr[0][num_vars -1] = y1;
+            regMatrix = new Array2DRowRealMatrix(regArr);
+            log.info(regMatrix);
+            prediction = (rls.getW().transpose().multiply(regMatrix.transpose())).getEntry(0, 0);
             log.info(" Iteration {} prediction  next arrival rate {}", iteration, (float) (prediction));
-            iteration++;
+          //  iteration++;
             if ((totalArrivalRate * 1000) > (size * poll)) {
                 if (size < numberOfPartitions) {
                     log.info("Consumers are less than nb partition we can scale");
@@ -318,7 +338,7 @@ public class Scaler {
                     if (replicas > 1) {
                         k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(replicas - 1);
                         scaled = true;
-                        firstIteration = true;
+                        //firstIteration = true;
                         start = Instant.now();
                         log.info("since   arrival rate {} is lower than max   consumption rate  with size -1 times dth, I down scaled  by one {}",
                                 totalArrivalRate * 1000,
@@ -330,17 +350,17 @@ public class Scaler {
             }
         } else {//the model is trained proactive autoscale
             double y1 = Double.parseDouble(String.valueOf((totalArrivalRate * 1000)));
-            log.info(" iteration {} last time  prediction  and arrival rate {}", iteration, (float) (prediction));
+            log.info(" iteration {} last time  prediction  of arrival rate {}", iteration, (float) (prediction));
             log.info(" iteration {} current actual value of  arrival rate = {}", iteration, y1);
-            rls.add_obs(X.transpose(), y1);
-            for (int j = 0; j < 3; j++)
-                Xx[0][j] = Xx[0][j + 1];
+            rls.add_obs(regMatrix.transpose(), y1);
+            for (int j = 0; j < num_vars - 1; j++)
+                regArr[0][j] = regArr[0][j + 1];
 
-            Xx[0][3] = y1;
+            regArr[0][num_vars-1] = y1;
 
-            X = new Array2DRowRealMatrix(Xx);
-            log.info(X);
-            prediction = (rls.getW().transpose().multiply(X.transpose())).getEntry(0, 0);
+            regMatrix = new Array2DRowRealMatrix(regArr);
+            log.info(regMatrix);
+            prediction = (rls.getW().transpose().multiply(regMatrix.transpose())).getEntry(0, 0);
             log.info(" Iteration {} prediction for next  arrival rate is {}", iteration, (float) (prediction));
 
             if ((prediction) > (size * poll) /*|| (totalArrivalRate*1000) > (size *poll)*/) /*totalConsumptionRate *1000*/ {
@@ -367,8 +387,8 @@ public class Scaler {
                     if (replicas > 1) {
                         k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(replicas - 1);
                         // firstIteration = true;
-                        scaled = true;
-                        firstIteration = true;
+                        //scaled = true;
+                        //firstIteration = true;
                         start = Instant.now();
                         log.info("since   arrival rate {} is lower than max   consumption rate  with size -1 times dth, I down scaled  by one {}",
                                 totalArrivalRate * 1000, ((size - 1) * poll));
@@ -614,7 +634,7 @@ public class Scaler {
                     k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(size + 1);
                     scaled = true;
                     start = Instant.now();
-                    firstIteration = true;
+                  //  firstIteration = true;
                     log.info("since  arrival rate   {} is greater than  maximum consumed messages rate " +
                                     "(size*poll/SEC) *uth ,  I up scaled  by one {}",
                             totalArrivalRate * 1000, /*size *poll*/ /*totalConsumptionRate *1000*/(size *poll*uth)/(float)SEC);
@@ -633,7 +653,7 @@ public class Scaler {
                     // firstIteration = true;
 
                     scaled = true;
-                    firstIteration = true;
+                   // firstIteration = true;
                     start = Instant.now();
 
                     log.info("since   arrival rate {} is lower than max   consumption rate " +
@@ -651,7 +671,7 @@ public class Scaler {
 
 
 
-/////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
 
 
     static void scaleDecision3(Map<String, ConsumerGroupDescription> consumerGroupDescriptionMap) {
@@ -744,6 +764,9 @@ public class Scaler {
         log.info("=================================:");
     }
 }
+
+
+
 
 
 
